@@ -11,3 +11,6 @@
 # local go build/test scratch
 /.gocache/
 /.gotmp/
+
+# python bytecode from the icon renderer
+__pycache__/
