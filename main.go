@@ -744,11 +744,19 @@ func (a *app) startHost() {
 // runHost performs one boot attempt on a specific port. It reports whether the
 // host published its URL, so the caller can decide between success, a retry, and
 // an error.
-func (a *app) runHost(bin string, prefix []string, port int) (bool, error) {
-	args := append(append([]string{}, prefix...), "web",
-		"--port", strconv.Itoa(port), "--no-open")
+// hostArgs builds the command line for the Harness host.
+//
+// The profile name is also the app name: `dsh web` boots the "web" profile,
+// and --profile selects one explicitly. Passing both would make the second
+// name a stray argument, so the profile goes in as the flag only.
+func hostArgs(prefix []string, profile string, port int) []string {
+	args := append([]string{}, prefix...)
+	args = append(args, "--profile", profile, "--port", strconv.Itoa(port), "--no-open")
+	return args
+}
 
-	cmd := exec.Command(bin, args...)
+func (a *app) runHost(bin string, prefix []string, port int) (bool, error) {
+	cmd := exec.Command(bin, hostArgs(prefix, a.cfg.profile, port)...)
 	cmd.Env = append(os.Environ(), "DSH_TELEMETRY_DISABLED=1")
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // own process group: one signal reaches every child
 	if a.cfg.verbose {

@@ -331,3 +331,29 @@ func TestBootPagesFollowTheDesktopTheme(t *testing.T) {
 		t.Error("boot page head does not name both colour schemes")
 	}
 }
+
+func TestHostArgsCarryTheProfile(t *testing.T) {
+	// -profile has to reach the host: it selects the profile under
+	// $DSH_HOME/profiles, and the profile name is also the app name.
+	args := hostArgs(nil, "work", 21777)
+	want := []string{"--profile", "work", "--port", "21777", "--no-open"}
+	if len(args) != len(want) {
+		t.Fatalf("host args are %v, want %v", args, want)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Fatalf("host args are %v, want %v", args, want)
+		}
+	}
+	// The node fallback prepends the CLI entry point.
+	args = hostArgs([]string{"/opt/dsh/bin.js"}, "web", 0)
+	want = []string{"/opt/dsh/bin.js", "--profile", "web", "--port", "0", "--no-open"}
+	if len(args) != len(want) {
+		t.Fatalf("host args are %v, want %v", args, want)
+	}
+	for i := range want {
+		if args[i] != want[i] {
+			t.Fatalf("host args are %v, want %v", args, want)
+		}
+	}
+}

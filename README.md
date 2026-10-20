@@ -116,6 +116,8 @@ If you keep presets in another profile, pass it:
 dsh-desktop -profile work
 ```
 
+The profile name is also the app name — `dsh web` boots the "web" profile — so
+the flag is handed to the host as `--profile <name>`.
 
 ### Unreadable menus
 
