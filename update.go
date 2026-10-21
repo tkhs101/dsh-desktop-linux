@@ -51,7 +51,7 @@ const (
 
 // releasesURL is the GitHub API endpoint for the newest published release. A
 // variable rather than a constant so the tests can point it at a local server.
-var releasesURL = "https://api.github.com/repos/folkwayse/dsh-desktop-linux/releases/latest"
+var releasesURL = "https://api.github.com/repos/tkhs101/dsh-desktop-linux/releases/latest"
 
 type release struct {
 	Tag    string `json:"tag_name"`
