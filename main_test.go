@@ -2,9 +2,11 @@ package main
 
 import (
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // occupy binds a loopback port and keeps it open for the duration of the test,
@@ -355,5 +357,43 @@ func TestHostArgsCarryTheProfile(t *testing.T) {
 		if args[i] != want[i] {
 			t.Fatalf("host args are %v, want %v", args, want)
 		}
+	}
+}
+
+// Closing the window hides it, so a second launch has to mean "show the window
+// that is already open". That request travels over the runtime socket; a stale
+// socket, or one belonging to another profile, must not look like a window that
+// can be surfaced.
+func TestSecondLaunchAsksTheWindowToShow(t *testing.T) {
+	// Short paths on purpose: a unix socket address is bounded at about 100
+	// bytes, and t.TempDir() would spend most of that on the test name.
+	dir, err := os.MkdirTemp("", "dshrt")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+
+	shown := make(chan struct{}, 2)
+	stop := serveShowRequests(runtimePath("show", ".show"), func() { shown <- struct{}{} })
+
+	if !askExistingWindow("show") {
+		t.Fatal("askExistingWindow = false while the listener is running")
+	}
+	select {
+	case <-shown:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the listener accepted the request but never surfaced the window")
+	}
+
+	// A window under a different profile is not this window.
+	if askExistingWindow("other") {
+		t.Error("askExistingWindow = true for a profile with no listener")
+	}
+
+	// Nor is a socket left behind by an instance that is gone.
+	stop()
+	if askExistingWindow("show") {
+		t.Error("askExistingWindow = true after the listener stopped")
 	}
 }

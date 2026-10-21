@@ -82,8 +82,14 @@ type config struct {
 	noDmabuf    bool
 	safeRender  bool
 	opaqueMenus bool
-	verbose     bool
-	selftest    time.Duration
+
+	// tray is the status icon, and with it the meaning of the close button:
+	// hiding needs somewhere to hide to, so closing only stops at the tray when
+	// the icon was actually created.
+	tray bool
+
+	verbose  bool
+	selftest time.Duration
 
 	// updateCheck is the boot-time check for a newer release. The two
 	// commands below run it in the foreground instead, and exit.
@@ -122,6 +128,12 @@ func main() {
 
 	unlock, err := acquireLock(cfg.profile)
 	if err != nil {
+		// A window hidden in the tray is still a window: a second launch is a
+		// request to surface it, not a conflict to report.
+		if askExistingWindow(cfg.profile) {
+			fmt.Fprintln(os.Stderr, "dsh-desktop: showing the window that is already open")
+			os.Exit(0)
+		}
 		fmt.Fprintln(os.Stderr, "dsh-desktop:", err)
 		os.Exit(1)
 	}
@@ -152,6 +164,7 @@ func parseFlags(args []string) (config, error) {
 	fs.BoolVar(&cfg.debug, "debug", false, "enable the WebKit inspector")
 	fs.BoolVar(&cfg.noDmabuf, "no-dmabuf", true, "disable WebKit's DMA-BUF renderer (prevents the fatal \"Could not create GBM EGL display\" abort on some drivers); pass -no-dmabuf=false to re-enable")
 	fs.BoolVar(&cfg.opaqueMenus, "opaque-menus", true, "make the client's translucent menus opaque, so their labels stay readable (pass -opaque-menus=false to keep the upstream translucency)")
+	fs.BoolVar(&cfg.tray, "tray", true, "show a tray icon, and close the window to it instead of quitting (needs libayatana-appindicator3 or libappindicator3 at run time; -tray=false closes as before)")
 	fs.BoolVar(&cfg.safeRender, "safe-render", false, "additionally disable WebKit compositing mode, for drivers that still render blank or garbled")
 	fs.BoolVar(&cfg.verbose, "verbose", false, "echo the host's output to stderr")
 	fs.DurationVar(&cfg.selftest, "selftest", 0, "load the app, inspect the rendered page, print a JSON report and exit (e.g. 20s)")
@@ -191,12 +204,18 @@ func parseFlags(args []string) (config, error) {
 // single instance, per profile
 // ---------------------------------------------------------------------------
 
-func acquireLock(profile string) (func(), error) {
+// runtimePath is where a profile's single-instance files live. XDG_RUNTIME_DIR
+// is the right home for them: it is per user, and cleared on logout.
+func runtimePath(profile, suffix string) string {
 	dir := os.Getenv("XDG_RUNTIME_DIR")
 	if dir == "" {
 		dir = os.TempDir()
 	}
-	path := filepath.Join(dir, "dsh-desktop-"+sanitize(profile)+".lock")
+	return filepath.Join(dir, "dsh-desktop-"+sanitize(profile)+suffix)
+}
+
+func acquireLock(profile string) (func(), error) {
+	path := runtimePath(profile, ".lock")
 
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
@@ -210,6 +229,20 @@ func acquireLock(profile string) (func(), error) {
 		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 		f.Close()
 	}, nil
+}
+
+// askExistingWindow asks the running instance to surface its window. That is
+// what a second launch means once closing hides to the tray: the window exists,
+// it is just not on screen. A lock with nobody behind it -- an instance that was
+// killed -- answers nothing, and the caller falls back to its own error.
+func askExistingWindow(profile string) bool {
+	conn, err := net.DialTimeout("unix", runtimePath(profile, ".show"), 500*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	_, _ = conn.Write([]byte("show\n"))
+	return true
 }
 
 // setDefaultEnv sets an environment variable only when the caller has not
@@ -273,6 +306,22 @@ func run(cfg config) int {
 	// centred in its work area. An explicit -width/-height overrides that.
 	width, height := a.windowSize()
 	a.applyStartGeometry(width, height)
+
+	// Close means hide once there is a tray icon to hide to: with the window
+	// gone from the screen and no icon, there would be no way back to it. The
+	// icon is created here, before the loop runs, so it is in place from the
+	// first frame. Without an indicator library the window keeps its old
+	// meaning -- closing ends the app -- and the reason is said out loud once.
+	if cfg.tray {
+		if !startTray(w.Window(), appName) {
+			fmt.Fprintln(os.Stderr, "dsh-desktop: no tray icon (install libayatana-appindicator3 or libappindicator3); closing the window quits")
+		}
+	}
+
+	// A second launch means "surface the window I already have", which matters
+	// most exactly when it is hidden in the tray and not on screen.
+	stopShow := a.listenForShow()
+	defer stopShow()
 
 	// Schedule the probe before the first paint. It fires once, `selftest` after
 	// startup, so it samples whatever is on screen by then: the boot screen when
@@ -372,6 +421,42 @@ func run(cfg config) int {
 		return a.printSelfTest()
 	}
 	return 0
+}
+
+// listenForShow answers the second launch: it accepts the connection the other
+// process makes, brings the window back, and drops the connection. Anything at
+// all on the socket means "show", so the protocol is one word and cannot get
+// out of step with an older build talking to a newer one.
+func (a *app) listenForShow() (stop func()) {
+	return serveShowRequests(runtimePath(a.cfg.profile, ".show"), func() {
+		a.w.Dispatch(func() { showWindow(a.w.Window()) })
+	})
+}
+
+// serveShowRequests is the socket side on its own, so the show-on-relaunch path
+// can be exercised without a window.
+func serveShowRequests(path string, show func()) (stop func()) {
+	os.Remove(path) // a stale socket from a previous run is not a listener
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		return func() {}
+	}
+	os.Chmod(path, 0o600)
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+			show()
+		}
+	}()
+	return func() {
+		listener.Close()
+		os.Remove(path)
+	}
 }
 
 // newSessionSettle is how long the client gets to swap from whatever view it

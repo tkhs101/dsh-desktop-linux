@@ -10,6 +10,7 @@ loopback URL the host prints on stdout, and loads that URL in a WebKitGTK window
 │  spawns:  dsh web --port 0 --no-open                     │
 │  reads:   "dsh web: http://127.0.0.1:37907/?token=..."   │
 │  shows:   that URL in a native WebKitGTK window          │
+│  close:   hides to the tray; Quit there ends the app     │
 │  quits:   kills the whole host process group             │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -38,6 +39,10 @@ Runtime packages, Debian/Ubuntu:
 ```sh
 sudo apt install libgtk-3-0 libwebkit2gtk-4.1-0
 ```
+
+For the tray icon, add one of `libayatana-appindicator3-1` (Debian/Ubuntu) or
+`libayatana-appindicator-gtk3` (Fedora). Both are optional: without either, the
+window closes as it always did — see [The tray icon](#the-tray-icon).
 
 Build packages:
 
@@ -79,6 +84,7 @@ dsh-desktop [options]
   -no-dmabuf        disable WebKit's DMA-BUF renderer (default true)
   -safe-render      additionally disable WebKit compositing mode
   -opaque-menus     make the client's translucent menus opaque (default true)
+  -tray             tray icon, and close the window to it (default true)
   -debug            enable the WebKit inspector
   -verbose          echo the host's output to stderr
   -check-update     print the newest release and whether it is newer, then exit
@@ -116,6 +122,48 @@ places the window itself — moving a window by request is an X11 privilege.
 
 If the display cannot report its geometry — a headless run — the flags'
 defaults of 1280x840 are used and nothing else changes.
+
+### The tray icon
+
+Closing the window hides it in the tray instead of ending the app. That is the
+only order that makes sense once the window can be gone from the screen: hiding
+it without an icon would leave no way back to it.
+
+The icon carries the menu:
+
+```
+Show Window
+Hide Window
+───────────
+Quit
+```
+
+A left click on the icon surfaces the window on the hosts that send an
+activation; the menu does the same thing for the hosts that do not. Quit is the
+one action that stops the app while the window is hidden, and it unwinds exactly
+as closing used to: the host process group is killed and the profile lock
+released.
+
+Starting the app again while the window is hidden surfaces the window that is
+already open instead of reporting that one is running. The request travels over
+a per-profile unix socket in `$XDG_RUNTIME_DIR`, so a second launch from the
+application menu does the obvious thing.
+
+`-tray=false` turns the icon off, and then closing quits again. The icon needs
+one of the two indicator libraries, at run time only:
+
+```sh
+sudo apt install libayatana-appindicator3-1     # Debian/Ubuntu
+sudo dnf install libayatana-appindicator-gtk3   # Fedora
+```
+
+Neither is a build dependency: the entry points are loaded when the window is
+created. Without either library the app starts exactly as before, says once on
+stderr why closing will quit, and leaves the window's old meaning in place.
+
+The icon is a StatusNotifierItem, so it works on X11 and on Wayland. GNOME still
+needs its AppIndicator extension to show any tray icon, which is a GNOME
+decision, not this app's.
 
 ### The port
 
