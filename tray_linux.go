@@ -83,10 +83,6 @@ static void dsh_tray_show(GtkWidget *win) {
   gtk_window_present(GTK_WINDOW(win));
 }
 
-static void dsh_tray_show_clicked(GtkMenuItem *item, gpointer data) {
-  dsh_tray_show(GTK_WIDGET(data));
-}
-
 // dsh_tray_show_window is the same action for Go: a second launch while the
 // window sits in the tray means "surface it", not "report a lock conflict".
 static void dsh_tray_show_window(GtkWidget *win) {
@@ -98,13 +94,67 @@ static void dsh_tray_indicator_clicked(AppIndicator *ind, gpointer data) {
   dsh_tray_show(GTK_WIDGET(data));
 }
 
-static void dsh_tray_hide_clicked(GtkMenuItem *item, gpointer data) {
-  gtk_widget_hide(GTK_WIDGET(data));
+// The restart actions. C owns the menu and the confirmation; the work itself --
+// reloading the page, respawning the host, replacing this process -- belongs to
+// Go, so the numbers cross the cgo bridge to tray_bridge_linux.go.
+enum { DSH_ACTION_FRONTEND = 1, DSH_ACTION_BACKEND = 2, DSH_ACTION_RESTART = 3 };
+
+extern void dshTrayAction(int action);
+
+// dsh_tray_confirm asks before an action that loses something: the host state
+// for a backend restart, the whole process for a full one. Cancel is the
+// default, and the dialog is parented to the window so it cannot get lost
+// behind it.
+static int dsh_tray_confirm(GtkWidget *win, int action) {
+  // The menu is reachable while the window is hidden in the tray, and a modal
+  // dialog over a hidden window would look like a hang: bring it back first.
+  dsh_tray_show(win);
+
+  const char *title;
+  const char *text;
+  if (action == DSH_ACTION_BACKEND) {
+    title = "仅重启后端？";
+    text = "将停止并重新启动 Harness 后端进程，窗口随后加载新地址。前端当前的页面状态会丢失。";
+  } else {
+    title = "完全重启？";
+    text = "将退出当前窗口并重新启动整个应用：前端与后端都会重启。";
+  }
+
+  GtkWidget *dialog = gtk_message_dialog_new(
+      GTK_WINDOW(win), GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT,
+      GTK_MESSAGE_QUESTION, GTK_BUTTONS_NONE, "%s", title);
+  gtk_window_set_title(GTK_WINDOW(dialog), title);
+  gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dialog), "%s", text);
+  gtk_dialog_add_button(GTK_DIALOG(dialog), "取消", GTK_RESPONSE_CANCEL);
+  gtk_dialog_add_button(GTK_DIALOG(dialog), "重启", GTK_RESPONSE_ACCEPT);
+  gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_CANCEL);
+
+  gint response = gtk_dialog_run(GTK_DIALOG(dialog));
+  gtk_widget_destroy(dialog);
+  return response == GTK_RESPONSE_ACCEPT;
 }
 
-// Quitting is the one action that cannot stay in C: the GTK loop is what
-// webview's Run() is blocked on, and quitting it is exactly what Terminate does
-// from Go. Run() then unwinds the host process and the profile lock as usual.
+// Reloading the page loses nothing that the page cannot rebuild, so it is the
+// one action that runs on a single click.
+static void dsh_tray_frontend_clicked(GtkMenuItem *item, gpointer data) {
+  dshTrayAction(DSH_ACTION_FRONTEND);
+}
+
+static void dsh_tray_backend_clicked(GtkMenuItem *item, gpointer data) {
+  if (dsh_tray_confirm(GTK_WIDGET(data), DSH_ACTION_BACKEND)) {
+    dshTrayAction(DSH_ACTION_BACKEND);
+  }
+}
+
+static void dsh_tray_restart_clicked(GtkMenuItem *item, gpointer data) {
+  if (dsh_tray_confirm(GTK_WIDGET(data), DSH_ACTION_RESTART)) {
+    dshTrayAction(DSH_ACTION_RESTART);
+  }
+}
+
+// Quit stays in C because it is one GTK call: the loop Run() is blocked on is
+// the thing that has to end, and gtk_main_quit is exactly what Terminate
+// dispatches. Run() then unwinds the host process and the profile lock as usual.
 static void dsh_tray_quit_clicked(GtkMenuItem *item, gpointer data) {
   gtk_main_quit();
 }
@@ -129,10 +179,11 @@ static int dsh_tray_start(GtkWidget *win, const char *icon, const char *title) {
   if (win == NULL || !dsh_tray_load()) return 0;
 
   GtkWidget *menu = gtk_menu_new();
-  dsh_tray_add(menu, "Show Window", G_CALLBACK(dsh_tray_show_clicked), win);
-  dsh_tray_add(menu, "Hide Window", G_CALLBACK(dsh_tray_hide_clicked), win);
+  dsh_tray_add(menu, "仅重启前端", G_CALLBACK(dsh_tray_frontend_clicked), win);
+  dsh_tray_add(menu, "仅重启后端", G_CALLBACK(dsh_tray_backend_clicked), win);
+  dsh_tray_add(menu, "完全重启", G_CALLBACK(dsh_tray_restart_clicked), win);
   gtk_menu_shell_append(GTK_MENU_SHELL(menu), gtk_separator_menu_item_new());
-  dsh_tray_add(menu, "Quit", G_CALLBACK(dsh_tray_quit_clicked), win);
+  dsh_tray_add(menu, "退出", G_CALLBACK(dsh_tray_quit_clicked), win);
   gtk_widget_show_all(menu);
 
   dsh_indicator = dsh_ind_new("dsh-desktop", icon, DSH_IND_CATEGORY_APP_STATUS);

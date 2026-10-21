@@ -132,22 +132,32 @@ it without an icon would leave no way back to it.
 The icon carries the menu:
 
 ```
-Show Window
-Hide Window
+仅重启前端     reload the page; the host is not touched
+仅重启后端     respawn the Harness host, then load its new address
+完全重启       replace this process with a fresh one
 ───────────
-Quit
+退出           stop the host and end the app
 ```
 
-A left click on the icon surfaces the window on the hosts that send an
-activation; the menu does the same thing for the hosts that do not. Quit is the
-one action that stops the app while the window is hidden, and it unwinds exactly
-as closing used to: the host process group is killed and the profile lock
-released.
+**仅重启前端** runs on a single click: it loads the page again and nothing else,
+which is the cheap way back from a client that has wedged itself. The host keeps
+running, so the address, the token, and the window all stay as they were.
 
-Starting the app again while the window is hidden surfaces the window that is
-already open instead of reporting that one is running. The request travels over
-a per-profile unix socket in `$XDG_RUNTIME_DIR`, so a second launch from the
-application menu does the obvious thing.
+**仅重启后端** and **完全重启** ask first, in a GTK dialog with Cancel as the
+default, because both lose something. The backend restart stops the host process
+group and boots a new host; the window keeps its page while that happens and
+follows the new address when the host publishes it. The full restart starts a
+replacement process — which waits for the profile lock — and then ends this one,
+so the app is never missing for longer than the handover. The replacement gets
+the same arguments and the same profile, and starts its own host.
+
+Either way the window is surfaced before the dialog opens: the menu is reachable
+while the window is hidden, and a modal dialog over a hidden window would look
+like a hang.
+
+A left click on the icon surfaces the window. Starting the app again while it is
+open — hidden or not — does the same thing, over a per-profile unix socket in
+`$XDG_RUNTIME_DIR`, instead of reporting that one is already running.
 
 `-tray=false` turns the icon off, and then closing quits again. The icon needs
 one of the two indicator libraries, at run time only:

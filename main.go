@@ -221,14 +221,26 @@ func acquireLock(profile string) (func(), error) {
 	if err != nil {
 		return func() {}, nil // a missing lock is not worth refusing to start over
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		f.Close()
-		return nil, fmt.Errorf("another dsh-desktop window is already open for profile %q", profile)
+
+	// A replacement process starts while the instance it replaces still holds
+	// the lock, so it waits the handover out instead of reporting a conflict.
+	deadline := time.Time{}
+	if os.Getenv(restartEnv) != "" {
+		deadline = time.Now().Add(restartLockWait)
 	}
-	return func() {
-		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
-		f.Close()
-	}, nil
+	for {
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+			return func() {
+				syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+				f.Close()
+			}, nil
+		}
+		if time.Now().After(deadline) {
+			f.Close()
+			return nil, fmt.Errorf("another dsh-desktop window is already open for profile %q", profile)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // askExistingWindow asks the running instance to surface its window. That is
@@ -291,6 +303,15 @@ type app struct {
 	// themeStop ends the desktop's colour-scheme listener. It is called when
 	// the window closes so the helper does not outlive the app.
 	themeStop atomic.Value // func()
+
+	// lastURL is the address the window is showing, so the tray's frontend
+	// restart can load it again without the host having to send it a second
+	// time.
+	lastURL atomic.Value // string
+
+	// restarting guards the one-at-a-time restarts a tray menu can start: a
+	// second click while the host is being respawned must not spawn another.
+	restarting atomic.Bool
 }
 
 func run(cfg config) int {
@@ -313,7 +334,11 @@ func run(cfg config) int {
 	// first frame. Without an indicator library the window keeps its old
 	// meaning -- closing ends the app -- and the reason is said out loud once.
 	if cfg.tray {
+		// The menu is C, so the actions it starts come back through this one
+		// package-level binding rather than a function pointer.
+		trayApp = a
 		if !startTray(w.Window(), appName) {
+			trayApp = nil
 			fmt.Fprintln(os.Stderr, "dsh-desktop: no tray icon (install libayatana-appindicator3 or libappindicator3); closing the window quits")
 		}
 	}
@@ -935,6 +960,10 @@ func (a *app) navigate(u string) {
 	if !a.alive.Load() {
 		return
 	}
+	// Kept so the tray can reload the page without asking the host for the
+	// address again; the token is part of it and does not change while the
+	// host lives.
+	a.lastURL.Store(u)
 	a.w.Dispatch(func() {
 		if !a.alive.Load() {
 			return
@@ -956,6 +985,91 @@ func (a *app) showError(title, detail, tail string) {
 		a.w.SetTitle(appName + " — error")
 		a.w.SetHtml(errorPage(a.cfg, title, detail, tail))
 	})
+}
+
+// ---------------------------------------------------------------------------
+// tray actions: frontend, backend, and the whole app
+// ---------------------------------------------------------------------------
+
+// The tray menu's actions, numbered the way the C side sends them.
+const (
+	trayActionFrontend = 1
+	trayActionBackend  = 2
+	trayActionRestart  = 3
+)
+
+// restartEnv marks a process an already-running instance started to replace
+// itself. It has to outlive the instance it replaces, so it waits for the
+// profile lock instead of failing on it.
+const restartEnv = "DSH_DESKTOP_RESTARTING"
+
+// restartLockWait is how long that replacement waits. A variable so the test can
+// hold the same handover in a fraction of a second.
+var restartLockWait = 10 * time.Second
+
+// trayApp is the instance the tray menu acts on. The menu is C, so this
+// binding is the only way its actions reach the running app.
+var trayApp *app
+
+func (a *app) trayAction(action int) {
+	switch action {
+	case trayActionFrontend:
+		a.restartFrontend()
+	case trayActionBackend:
+		a.restartBackend()
+	case trayActionRestart:
+		a.restartApplication()
+	}
+}
+
+// restartFrontend loads the page again and leaves the host alone. Nothing is
+// lost that the page cannot rebuild, which is why the menu runs it on a single
+// click while the other two ask first.
+func (a *app) restartFrontend() {
+	if u, ok := a.lastURL.Load().(string); ok && u != "" {
+		a.navigate(u)
+	}
+}
+
+// restartBackend stops the host and boots a new one. The window keeps showing
+// the page it has while that happens -- that is what makes this the cheap
+// restart -- and follows the new address when the host publishes it.
+func (a *app) restartBackend() {
+	if a.cfg.url != "" {
+		// An attached window has no host of its own; reloading is all there is.
+		a.restartFrontend()
+		return
+	}
+	if !a.restarting.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer a.restarting.Store(false)
+		a.stopHost()
+		a.startHost()
+	}()
+}
+
+// restartApplication replaces the running process with a fresh one. The
+// replacement is started before this process ends and waits for the profile
+// lock, so the app is never missing for longer than the handover itself.
+func (a *app) restartApplication() {
+	exe, err := os.Executable()
+	if err != nil {
+		a.showError("无法重新启动应用", err.Error(), "")
+		return
+	}
+	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd.Env = append(os.Environ(), restartEnv+"=1")
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	// Its own session: the replacement has to survive this process ending, and
+	// stay out of reach of the signal that ends the host's process group.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := cmd.Start(); err != nil {
+		a.showError("无法重新启动应用", err.Error(), "")
+		return
+	}
+	a.w.Terminate()
 }
 
 // ---------------------------------------------------------------------------

@@ -397,3 +397,49 @@ func TestSecondLaunchAsksTheWindowToShow(t *testing.T) {
 		t.Error("askExistingWindow = true after the listener stopped")
 	}
 }
+
+// A replacement process is started before the instance it replaces lets go of
+// the profile lock, so it has to wait for the handover -- and an ordinary second
+// launch must not wait at all, it reports the conflict.
+func TestRestartWaitsForTheProfileLock(t *testing.T) {
+	dir, err := os.MkdirTemp("", "dshlock")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+
+	unlock, err := acquireLock("lock")
+	if err != nil {
+		t.Fatalf("first lock: %v", err)
+	}
+
+	// Not a replacement: the second launch is told the window is taken.
+	if _, err := acquireLock("lock"); err == nil {
+		t.Fatal("a second launch acquired the lock while it was held")
+	}
+
+	// A replacement waits, then takes the lock the moment the old one lets go.
+	t.Setenv(restartEnv, "1")
+	previous := restartLockWait
+	restartLockWait = 2 * time.Second
+	t.Cleanup(func() { restartLockWait = previous })
+
+	released := make(chan struct{})
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		unlock()
+		close(released)
+	}()
+
+	start := time.Now()
+	unlock2, err := acquireLock("lock")
+	if err != nil {
+		t.Fatalf("the replacement never got the lock: %v", err)
+	}
+	defer unlock2()
+	<-released
+	if elapsed := time.Since(start); elapsed < 200*time.Millisecond {
+		t.Errorf("the replacement acquired the lock after %v, before it was released", elapsed)
+	}
+}
