@@ -192,6 +192,29 @@ else while the window is open. A stable port means the URL survives restarts.
 A probe cannot reserve the port for the child that will actually bind it, so a
 lost race is retried from the next free port rather than shown as an error.
 
+### When the app is killed
+
+The host runs in its own process group, so one signal reaches every process in
+it: the Harness server, its MCP bridges, and whatever they started. That is what
+makes quitting complete. Closing the window (`-tray=false`), quitting from the
+tray, `SIGINT`, `SIGTERM`, and both restarts were checked process by process —
+the host, the WebKit processes, and the plugin children all go, no zombie is
+left, and the runtime socket is removed.
+
+The price of that separate process group is that the kernel will not take the
+host down when this process dies without running cleanup: a `SIGKILL`, an OOM
+kill, a crash. That case is covered on the way back up instead. While it runs,
+the host's pid and the kernel's start time are written next to the profile lock,
+and the next launch — which holds the lock, so no instance is running — ends
+whatever is still alive before starting its own:
+
+```
+dsh-desktop: ending a host left behind by a previous run (pid 57341)
+```
+
+The start time is the safety net. A pid on its own may have been reused between
+the crash and the next launch, and a process that is not ours is never signalled.
+
 ### The `-profile` flag is the important one
 
 Your agent presets — including **montir** — live in a profile, not in the app.
@@ -387,8 +410,8 @@ library. `make` and `install.sh` put that directory on `PKG_CONFIG_PATH`.
   CLI and the profile's plugins are updated by the `dsh-autoupdate` plugin.
 - **`dsh` must resolve.** If the CLI is not on `PATH`, pass `--dsh <path>` or set
   `DSH_BIN`.
-- **Single instance per profile.** A second launch refuses to start while one
-  window is open for the same profile.
+- **Single instance per profile.** A second launch does not open a second
+  window: it surfaces the one that is already open, hidden in the tray or not.
 
 ## Licence
 

@@ -11,6 +11,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -138,6 +139,15 @@ func main() {
 		os.Exit(1)
 	}
 	defer unlock()
+
+	// The lock is ours, so any host recorded for this profile belongs to an
+	// instance that died without cleaning up. End it before starting another,
+	// or it would sit there holding a port and a session nobody can reach.
+	// An attached window (-url) has no host of its own; leave whatever is
+	// running alone in that case.
+	if cfg.url == "" {
+		reapStaleHost(cfg.profile)
+	}
 
 	os.Exit(run(cfg))
 }
@@ -902,6 +912,7 @@ func (a *app) runHost(bin string, prefix []string, port int) (bool, error) {
 		close(done)
 		return false, fmt.Errorf("cannot start the host: %w", err)
 	}
+	a.recordHost(cmd.Process.Pid)
 
 	sc := bufio.NewScanner(stdout)
 	sc.Buffer(make([]byte, 0, 64<<10), 1<<20)
@@ -941,6 +952,10 @@ func (a *app) stopHost() {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
+	// The record exists to cover a death that skips this cleanup; once the host
+	// is really gone it is stale by definition.
+	defer a.clearHostRecord()
+
 	pgid := cmd.Process.Pid
 	_ = syscall.Kill(-pgid, syscall.SIGTERM)
 
@@ -954,6 +969,122 @@ func (a *app) stopHost() {
 	case <-done:
 	case <-time.After(killGrace):
 	}
+}
+
+// ---------------------------------------------------------------------------
+// surviving a hard death
+// ---------------------------------------------------------------------------
+
+// The host runs in its own process group, which is what lets one signal reach
+// the whole tree. The price is that the kernel will not take it down when this
+// process dies without running cleanup: a SIGKILL, an OOM kill, a crash. So the
+// host's pid and its kernel start time are written beside the profile lock, and
+// the next launch ends whatever is still there.
+//
+// The start time is what makes the record safe to act on: a bare pid can be
+// reused between the crash and the next launch, and a process that is not ours
+// must never be signalled.
+
+func hostRecordPath(profile string) string {
+	return runtimePath(profile, ".host")
+}
+
+// recordHost remembers the host so a later launch can clean it up if this one
+// never gets to.
+func (a *app) recordHost(pid int) {
+	record := fmt.Sprintf("%d %d\n", pid, procStartTime(pid))
+	if err := os.WriteFile(hostRecordPath(a.cfg.profile), []byte(record), 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, "dsh-desktop: cannot record the host pid:", err)
+	}
+}
+
+func (a *app) clearHostRecord() {
+	_ = os.Remove(hostRecordPath(a.cfg.profile))
+}
+
+// reapStaleHost ends a host that outlived the instance which started it. It is
+// called under the profile lock, so there is no live instance the host could
+// belong to -- if the record matches a running process, that process is a
+// leftover.
+func reapStaleHost(profile string) {
+	path := hostRecordPath(profile)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	_ = os.Remove(path) // the record has done its job either way
+
+	var pid int
+	var started uint64
+	if _, err := fmt.Sscanf(strings.TrimSpace(string(data)), "%d %d", &pid, &started); err != nil || pid <= 1 {
+		return
+	}
+	if procStartTime(pid) != started {
+		return // already gone, or that pid belongs to something else now
+	}
+	if !isDshHost(pid, profile) {
+		return // not a host of ours; never signal a stranger
+	}
+
+	fmt.Fprintf(os.Stderr, "dsh-desktop: ending a host left behind by a previous run (pid %d)\n", pid)
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	_ = syscall.Kill(pid, syscall.SIGTERM)
+	for i := 0; i < 20; i++ {
+		if syscall.Kill(pid, 0) != nil {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+}
+
+// isDshHost reports whether pid is a Harness host started for this profile: the
+// same arguments this app passes, so a recycled pid cannot pass for one.
+func isDshHost(pid int, profile string) bool {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return false
+	}
+	args := strings.Split(strings.TrimSuffix(string(data), "\x00"), "\x00")
+	var named, hasProfile, noOpen bool
+	for i, arg := range args {
+		if strings.Contains(arg, "dsh") {
+			named = true
+		}
+		if arg == "--profile" && i+1 < len(args) && args[i+1] == profile {
+			hasProfile = true
+		}
+		if arg == "--no-open" {
+			noOpen = true
+		}
+	}
+	return named && hasProfile && noOpen
+}
+
+// procStartTime reads the kernel's start time for a pid (field 22 of
+// /proc/<pid>/stat), which is stable for the life of the process and different
+// for anything that reuses the number later.
+func procStartTime(pid int) uint64 {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0
+	}
+	// The comm field is parenthesised and may itself contain spaces and
+	// parentheses, so the fields are counted from the last ')'.
+	end := bytes.LastIndexByte(data, ')')
+	if end < 0 {
+		return 0
+	}
+	fields := strings.Fields(string(data[end+1:]))
+	if len(fields) < 20 {
+		return 0
+	}
+	started, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil {
+		return 0
+	}
+	return started
 }
 
 func (a *app) navigate(u string) {

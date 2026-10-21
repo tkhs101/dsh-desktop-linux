@@ -1,10 +1,14 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -441,5 +445,137 @@ func TestRestartWaitsForTheProfileLock(t *testing.T) {
 	<-released
 	if elapsed := time.Since(start); elapsed < 200*time.Millisecond {
 		t.Errorf("the replacement acquired the lock after %v, before it was released", elapsed)
+	}
+}
+
+// procStartTime must read the kernel field that distinguishes one process from
+// whatever reuses its pid later.
+func TestProcStartTimeIsStable(t *testing.T) {
+	first := procStartTime(os.Getpid())
+	if first == 0 {
+		t.Fatal("procStartTime returned 0 for the test process itself")
+	}
+	if second := procStartTime(os.Getpid()); second != first {
+		t.Fatalf("procStartTime changed from %d to %d for a live process", first, second)
+	}
+}
+
+// reapStaleHost exists for the death that skips cleanup. It must end the host it
+// recorded -- and nothing else: not a recycled pid, not a process that merely
+// happens to be running.
+func TestReapStaleHostLeavesStrangersAlone(t *testing.T) {
+	dir, err := os.MkdirTemp("", "dshreap")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+
+	stranger := exec.Command("sleep", "30")
+	if err := stranger.Start(); err != nil {
+		t.Skipf("cannot start a decoy process: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = stranger.Process.Kill()
+		_, _ = stranger.Process.Wait()
+	})
+	pid := stranger.Process.Pid
+	alive := func() bool { return syscall.Kill(pid, 0) == nil }
+
+	// Recorded as if it were a host, though its command line says otherwise.
+	a := &app{cfg: config{profile: "web"}}
+	a.recordHost(pid)
+	reapStaleHost("web")
+	if !alive() {
+		t.Fatal("reapStaleHost killed a process that is not a dsh host")
+	}
+
+	// A pid whose start time no longer matches: the number was reused.
+	record := fmt.Sprintf("%d %d\n", pid, procStartTime(pid)+1)
+	if err := os.WriteFile(hostRecordPath("web"), []byte(record), 0o600); err != nil {
+		t.Fatalf("write record: %v", err)
+	}
+	reapStaleHost("web")
+	if !alive() {
+		t.Fatal("reapStaleHost killed a process whose start time did not match")
+	}
+}
+
+// A real host left behind by a SIGKILL is ended on the next launch: that is the
+// whole point of the record.
+func TestReapStaleHostEndsARecordedHost(t *testing.T) {
+	dir, err := os.MkdirTemp("", "dshreap")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+
+	// A stand-in for `dsh`: same argv shape, so the command-line check accepts
+	// it, and it keeps a child of its own in the same process group.
+	fake := filepath.Join(dir, "dsh")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nsleep 30\n"), 0o755); err != nil {
+		t.Fatalf("write stand-in: %v", err)
+	}
+	host := exec.Command(fake, "--profile", "web", "--port", "0", "--no-open")
+	host.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := host.Start(); err != nil {
+		t.Skipf("cannot start the stand-in host: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(-host.Process.Pid, syscall.SIGKILL)
+		_, _ = host.Process.Wait()
+	})
+
+	a := &app{cfg: config{profile: "web"}}
+	a.recordHost(host.Process.Pid)
+
+	reapStaleHost("web")
+
+	waited := make(chan struct{})
+	go func() {
+		_, _ = host.Process.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the recorded host was still running after reapStaleHost")
+	}
+	if _, err := os.Stat(hostRecordPath("web")); !os.IsNotExist(err) {
+		t.Error("the host record survived the reap")
+	}
+}
+
+// A backend restart is stopHost followed by runHost: the record has to go when
+// the host goes, or the next launch would try to reap a host that is already
+// gone (and, worse, could reap a fresh one that reused the pid).
+func TestStopHostClearsTheRecord(t *testing.T) {
+	dir, err := os.MkdirTemp("", "dshstop")
+	if err != nil {
+		t.Fatalf("temp dir: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+
+	cmd := exec.Command("sleep", "30")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start a stand-in host: %v", err)
+	}
+	t.Cleanup(func() { _ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) })
+
+	done := make(chan struct{})
+	close(done) // stopHost treats a closed channel as "already gone"
+	a := &app{cfg: config{profile: "web"}, cmd: cmd, done: done}
+	a.recordHost(cmd.Process.Pid)
+	if _, err := os.Stat(hostRecordPath("web")); err != nil {
+		t.Fatalf("record was not written: %v", err)
+	}
+
+	a.stopHost()
+
+	if _, err := os.Stat(hostRecordPath("web")); !os.IsNotExist(err) {
+		t.Error("the record survived stopHost")
 	}
 }
